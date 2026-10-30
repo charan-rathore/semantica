@@ -59,10 +59,15 @@ if TYPE_CHECKING:
     from .core.orchestrator import Semantica
 
 console = Console()
+# --json reserves stdout for the machine-readable payload, so warnings go
+# here instead. See the --json promise in the CLI context setup below.
+err_console = Console(stderr=True)
 
-# Supported interpreter range: ``requires-python = ">=3.10,<3.14"`` in
+# Supported interpreter range: ``requires-python = ">=3.11,<3.14"`` in
 # pyproject.toml. tests/test_python_support_policy.py fails if the two drift.
-MIN_PYTHON = (3, 10)
+# 3.10 was dropped in 0.8.0: it is past end of life and Pillow 13, which has
+# the security fixes 12.x lacks, needs 3.11 (#2067).
+MIN_PYTHON = (3, 11)
 MAX_PYTHON_EXCLUSIVE = (3, 14)
 
 
@@ -551,10 +556,7 @@ def _show_startup(cli_ctx: CLIContext) -> None:
         return
     cfg = cli_ctx.config.to_dict()
     graph_store = _resolve_graph_backend(cli_ctx)
-    vector_store = (
-        cli_ctx.vector_store_backend
-        or cfg.get("vector_store", {}).get("backend", "faiss")
-    )
+    vector_store = _configured_vector_backend(cli_ctx) or _DEFAULT_VECTOR_BACKEND
     profile = cfg.get("profile", "default")
 
     console.print()
@@ -656,8 +658,9 @@ def main(
         # Reinitialize the module-level console if --no-color was requested so
         # all subsequent console.print() calls in this invocation respect the flag.
         if no_color:
-            global console  # noqa: PLW0603
+            global console, err_console  # noqa: PLW0603
             console = Console(no_color=True)
+            err_console = Console(stderr=True, no_color=True)
         ctx.obj = CLIContext(
             config_path=_resolve_config_path(config_path),
             config=config,
@@ -821,6 +824,42 @@ def shell(ctx: click.Context) -> None:
             _warn(cli_ctx, f"Error: {exc}")
 
 
+def _plain_release(version: str) -> Optional[Tuple[int, ...]]:
+    """Parse a plain X.Y.Z release into a comparable tuple, or None.
+
+    Trailing zero components are dropped so 0.8 and 0.8.0 compare equal.
+    """
+    if not re.fullmatch(r"\d+(\.\d+)*", version):
+        return None
+    parts = [int(p) for p in version.split(".")]
+    while len(parts) > 1 and parts[-1] == 0:
+        parts.pop()
+    return tuple(parts)
+
+
+def _compare_versions(a: str, b: str) -> Optional[int]:
+    """Compare two version strings: 1 if a > b, 0 if equal, -1 if a < b.
+
+    Uses PEP 440 ordering when packaging is installed. It is not a core
+    dependency (#1513), so without it only plain X.Y.Z releases are ordered.
+    Returns None when no ordering can be established (e.g. a missing release
+    tag), so callers never guess an update from string equality.
+    """
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError:
+        ra, rb = _plain_release(a), _plain_release(b)
+        if ra is None or rb is None:
+            return 0 if a == b else None
+        return (ra > rb) - (ra < rb)
+
+    try:
+        va, vb = Version(a), Version(b)
+    except InvalidVersion:
+        return None
+    return (va > vb) - (va < vb)
+
+
 @main.command()
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
@@ -844,20 +883,36 @@ def changelog(cli_ctx: CLIContext, local_json: bool) -> None:
         tag: str = data.get("tag_name", "unknown")
         body: str = data.get("body", "").strip()
         html_url: str = data.get("html_url", "")
-        latest = tag.lstrip("v")
+        latest = tag.removeprefix("v")
         current = __version__
+        order = _compare_versions(latest, current)
+        update_available = None if order is None else order > 0
 
         if _is_json(cli_ctx, local_json):
-            _jecho({"current": current, "latest": latest, "url": html_url, "notes": body})
+            _jecho({
+                "current": current,
+                "latest": latest,
+                "update_available": update_available,
+                "url": html_url,
+                "notes": body,
+            })
             return
 
-        up_to_date = latest == current
-        status = (
-            f"[{_SUCCESS}]You are on the latest version ({current})[/{_SUCCESS}]"
-            if up_to_date
-            else f"[{_WARN_STY}]Update available: {current} → {latest}[/{_WARN_STY}]\n"
-                 f"[{_DIM}]pip install --upgrade semantica[/{_DIM}]"
-        )
+        if order is None:
+            status = f"[{_DIM}]Could not compare {current} with release {tag}[/{_DIM}]"
+        elif order > 0:
+            status = (
+                f"[{_WARN_STY}]Update available: {current} → {latest}[/{_WARN_STY}]\n"
+                f"[{_DIM}]pip install --upgrade semantica[/{_DIM}]"
+            )
+        elif order == 0:
+            status = f"[{_SUCCESS}]You are on the latest version ({current})[/{_SUCCESS}]"
+        else:
+            # A dev or unreleased build sorts above the latest published release.
+            status = (
+                f"[{_SUCCESS}]You are ahead of the latest release "
+                f"({current} > {latest})[/{_SUCCESS}]"
+            )
         console.print(
             Panel(
                 Text.from_markup(
@@ -870,7 +925,7 @@ def changelog(cli_ctx: CLIContext, local_json: bool) -> None:
                 padding=(1, 2),
             )
         )
-        if html_url and not up_to_date:
+        if html_url and update_available:
             console.print(f"  [{_DIM}]Full notes: {html_url}[/{_DIM}]")
 
     _run_with_error_handling(_action)
@@ -947,14 +1002,73 @@ def doctor(cli_ctx: CLIContext, local_json: bool, deep_embeddings: bool) -> None
             return f"{backend} reachable"
         checks.append(_check("Graph store", _graph, hint="run 'semantica store list' to see configured backends"))
 
-        # Vector store
+        # Vector store: the one CLI commands build (--vector-store or
+        # vector_store.backend). The MCP server's own store is checked below.
+        configured_vector = _configured_vector_backend(cli_ctx)
+        mcp_configured = _mcp_stores_configured()
+
         def _vector() -> str:
-            cfg = cli_ctx.config.to_dict()
-            backend = cli_ctx.vector_store_backend or cfg.get("vector_store", {}).get("backend", "faiss")
+            backend = configured_vector or _DEFAULT_VECTOR_BACKEND
             if backend == "faiss":
                 import faiss  # noqa: F401
+            elif backend == "sqlite":
+                _probe_sqlite_vec()
+                return "sqlite-vec loaded"
             return f"{backend} importable"
-        checks.append(_check("Vector store", _vector, hint="pip install semantica[vectorstore-…]"))
+        vector_row = _check(
+            "Vector store", _vector, hint="pip install semantica[vectorstore-…]"
+        )
+        if vector_row[1] == "fail" and not configured_vector and mcp_configured:
+            # Nothing asked the CLI for faiss and this deployment configures
+            # the MCP server instead, so the missing default is not an error
+            # for it — only for CLI vector commands (#1818).
+            vector_row = (
+                "Vector store", "warn", f"{vector_row[2]} (CLI default)",
+                "set vector_store.backend to use CLI vector commands",
+            )
+        checks.append(vector_row)
+
+        # MCP server stores (#1818): configured only through the environment
+        # and resolved by the server's own session helpers, so this reports
+        # exactly what `semantica mcp` would build.
+        def _mcp_vector() -> str:
+            from semantica_mcp.mcp.session import resolve_vector_backend
+
+            backend, _ = resolve_vector_backend()
+            if backend == "sqlite":
+                _probe_sqlite_vec()
+                return "sqlite-vec loaded"
+            return backend
+
+        def _mcp_graph() -> str:
+            from semantica_mcp.mcp.session import kg_file_to_load, kg_path
+            from .context import ContextGraph
+
+            if not kg_path():
+                return "in-memory, not persisted (SEMANTICA_KG_PATH unset)"
+            path = kg_file_to_load()
+            if path is None:
+                return "new graph, created on first save"
+            graph = ContextGraph()
+            try:
+                graph.load_from_file(path)
+            except Exception as exc:
+                # The server would start empty and refuse to save over it.
+                raise RuntimeError(
+                    f"cannot load {path}: {exc}; persistence would be disabled"
+                ) from exc
+            return f"{len(graph.get_nodes_by_label('decision'))} decision(s)"
+
+        if mcp_configured:
+            checks.append(_check(
+                "MCP vector store", _mcp_vector,
+                hint="check SEMANTICA_VECTOR_*; sqlite needs "
+                     "pip install 'semantica[vectorstore-sqlite]'",
+            ))
+            checks.append(_check(
+                "MCP graph", _mcp_graph,
+                hint="fix or move the file at SEMANTICA_KG_PATH",
+            ))
 
         # Embedding backends (#994): `doctor` used to report all green while
         # every local embedding backend was non-functional — import success
@@ -1267,6 +1381,19 @@ _LOCK_TIMEOUT_SECONDS = 10.0
 # `semantica init` offers memory as its default and ContextGraph serves it
 # without any server, so it is also the fallback when nothing is configured.
 _DEFAULT_GRAPH_BACKEND = MEMORY_GRAPH_BACKEND
+# VectorStore's own default: what CLI vector commands build when neither
+# --vector-store nor vector_store.backend is set.
+_DEFAULT_VECTOR_BACKEND = "faiss"
+# Environment that configures the MCP server's stores
+# (semantica_mcp/mcp/session.py). It never changes what the CLI builds, so
+# ``doctor`` reports it in rows of its own rather than folding it into the
+# CLI's vector and graph checks (#1818).
+_MCP_STORE_ENV_VARS = (
+    "SEMANTICA_VECTOR_BACKEND",
+    "SEMANTICA_VECTOR_DB_PATH",
+    "SEMANTICA_VECTOR_PATH",
+    "SEMANTICA_KG_PATH",
+)
 
 
 def _resolve_graph_backend(cli_ctx: CLIContext) -> str:
@@ -1280,6 +1407,33 @@ def _resolve_graph_backend(cli_ctx: CLIContext) -> str:
     return cli_ctx.store_backend or graph_db.get(
         "backend", _DEFAULT_GRAPH_BACKEND
     )
+
+
+def _configured_vector_backend(cli_ctx: CLIContext) -> Optional[str]:
+    """The ``--vector-store`` flag or ``vector_store.backend``; None if unset."""
+    return cli_ctx.vector_store_backend or cli_ctx.config.to_dict().get(
+        "vector_store", {}
+    ).get("backend")
+
+
+def _mcp_stores_configured() -> bool:
+    """True when the environment configures the MCP server's stores."""
+    return any(os.environ.get(var, "").strip() for var in _MCP_STORE_ENV_VARS)
+
+
+def _probe_sqlite_vec() -> None:
+    """Raise unless the sqlite-vec extension actually loads.
+
+    ``SQLITE_VEC_AVAILABLE`` is a ``find_spec`` probe: it proves the package is
+    discoverable, not that the native extension loads. Building a throwaway
+    in-memory store runs the store's real load path, so a broken install fails
+    here rather than on first use.
+    """
+    from .vector_store.sqlite_vec_store import SQLITE_VEC_AVAILABLE, SQLiteVecStore
+
+    if not SQLITE_VEC_AVAILABLE:
+        raise ImportError("sqlite-vec is not installed")
+    SQLiteVecStore(db_path=":memory:", table_name="doctor_probe", dimension=1).close()
 
 
 def _uses_memory_graph(cli_ctx: CLIContext) -> bool:
@@ -1700,6 +1854,78 @@ def _graph_store_as_context(cli_ctx: CLIContext) -> Dict[str, List[Dict[str, Any
     return {"entities": entities, "relationships": rel_out}
 
 
+def _knowledge_graph_dict(cli_ctx: CLIContext) -> Dict[str, List[Dict[str, Any]]]:
+    """Entities and relationships for the configured graph backend.
+
+    Mirrors the routing `export` uses: the ``memory`` backend is served by the
+    in-process ContextGraph, every other backend by GraphStore. Callers that
+    only read entities and relationships (conflict detection, ontology
+    generation) go through here instead of `_graph_store_as_context`, which
+    raises for the default ``memory`` backend.
+    """
+    if _uses_memory_graph(cli_ctx):
+        kg = _load_context_graph(cli_ctx).to_kg_dict()
+        return {
+            "entities": kg.get("entities", []),
+            "relationships": kg.get("relationships", []),
+        }
+    return _graph_store_as_context(cli_ctx)
+
+
+def _flatten_properties(entity: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy an entity with its nested business attributes lifted to the top level.
+
+    Both graph adapters keep an entity's attributes under ``properties``, while
+    the consumers behind these commands (ontology property inference, conflict
+    detection) read top-level keys. Structural fields win on a name clash so
+    ``id``/``type`` keep their meaning.
+    """
+    flattened = dict(entity)
+    for key, value in (entity.get("properties") or {}).items():
+        flattened.setdefault(key, value)
+    return flattened
+
+
+def _ontology_input_graph(
+    graph: Dict[str, List[Dict[str, Any]]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Adapt a graph for OntologyGenerator's entity shape.
+
+    Its property inference reads top-level keys and lists ``properties`` itself
+    as a control field, so a graph read from a backend otherwise produced an
+    ontology with no properties at all (#1814 review).
+    """
+    return {
+        "entities": [_flatten_properties(e) for e in graph.get("entities", [])],
+        "relationships": graph.get("relationships", []),
+    }
+
+
+def _conflict_entities(
+    graph: Dict[str, List[Dict[str, Any]]]
+) -> List[Dict[str, Any]]:
+    """Adapt a graph for ConflictDetector's entity shape.
+
+    Its value and property strategies read ``property_name`` off the entity
+    itself, so a stored attribute under ``properties`` was never compared and
+    no conflict was reported (#1814 review).
+    """
+    return [_flatten_properties(e) for e in graph.get("entities", [])]
+
+
+def _ontology_from_graph(
+    cli_ctx: CLIContext,
+    graph: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+) -> Dict[str, Any]:
+    """Build an ontology dict from the configured graph's entities/relationships."""
+    from .ontology import OntologyGenerator
+
+    data = graph if graph is not None else _knowledge_graph_dict(cli_ctx)
+    return OntologyGenerator(config=cli_ctx.config.to_dict()).generate_ontology(
+        _ontology_input_graph(data)
+    )
+
+
 def _lowercase_datalog_args(fact_str: str) -> str:
     """Lowercase only a fact string's arguments, keeping the predicate's
     case untouched.
@@ -1757,7 +1983,10 @@ def _info(cli_ctx: CLIContext, text: str) -> None:
 
 
 def _warn(cli_ctx: CLIContext, text: str) -> None:
-    console.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
+    # Under --json the payload owns stdout, so the warning goes to stderr and
+    # the output stays one parseable document.
+    stream = err_console if cli_ctx.json_output else console
+    stream.print(f"[{_WARN_STY}] ⚠[/{_WARN_STY}] {text}")
 
 
 def _dry(cli_ctx: CLIContext, action: str, *, json_out: bool = False, **fields: Any) -> None:
@@ -3981,6 +4210,22 @@ def temporal_allen(
     _run_with_error_handling(_action)
 
 
+def _provenance_manager(cli_ctx: CLIContext) -> Any:
+    """Open the provenance store the CLI's commands share.
+
+    A configured ``provenance.storage_path`` wins; otherwise the CLI opens the
+    database the Explorer uses (``SEMANTICA_PROVENANCE_DB`` /
+    ``EXPLORER_PROVENANCE_DB``). Before this every command read a fresh
+    in-memory store and reported nothing (#1810).
+    """
+    from .provenance import ProvenanceManager, storage_path_from_env
+
+    storage_path = None
+    if not cli_ctx.config.get("provenance.storage_path"):
+        storage_path = storage_path_from_env()
+    return ProvenanceManager(storage_path=storage_path, config=cli_ctx.config.to_dict())
+
+
 @main.group(invoke_without_command=True)
 @click.pass_context
 def provenance(ctx: click.Context) -> None:
@@ -4005,8 +4250,7 @@ def provenance_lineage(cli_ctx: CLIContext, entity_id: str, depth: int, local_js
 
     def _action() -> None:
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.lineage(entity_id, depth=depth)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -4042,8 +4286,7 @@ def provenance_audit(cli_ctx: CLIContext, since: Optional[str], fmt: str,
             _dry(cli_ctx, "export audit log", since=since, format=fmt, output=output)
             return
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.audit_log(since=since, format=fmt)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -4082,8 +4325,7 @@ def provenance_export(cli_ctx: CLIContext, fmt: str, base_uri: Optional[str],
             _dry(cli_ctx, "export provenance", format=fmt, base_uri=base_uri, output=output)
             return
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             data = pm.export_prov(format=fmt, base_uri=base_uri)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -4106,8 +4348,7 @@ def provenance_check(cli_ctx: CLIContext, strict: bool, local_json: bool) -> Non
 
     def _action() -> None:
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.check(strict=strict)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -4149,8 +4390,7 @@ def provenance_invalidate(cli_ctx: CLIContext, entity_id: str, agent_id: str,
             _dry(cli_ctx, "invalidate provenance entity", entity_id=entity_id, by=agent_id, reason=reason)
             return
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.invalidate(entity_id, agent_id=agent_id, reason=reason)
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -4181,8 +4421,7 @@ def provenance_verify_chain(cli_ctx: CLIContext, local_json: bool) -> None:
 
     def _action() -> None:
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             result = pm.verify_chain()
         except ImportError as exc:
             raise click.ClickException(f"Provenance module not available: {exc}") from exc
@@ -4218,8 +4457,7 @@ def provenance_descendants(cli_ctx: CLIContext, entity_id: str, depth: Optional[
 
     def _action() -> None:
         try:
-            from .provenance import ProvenanceManager
-            pm = ProvenanceManager(config=cli_ctx.config.to_dict())
+            pm = _provenance_manager(cli_ctx)
             if depth is not None:
                 entries = [e.to_dict() for e in pm.trace_descendants(entity_id, max_depth=depth)]
                 result = {"entity_id": entity_id, "depth": depth, "entries": entries}
@@ -4243,40 +4481,88 @@ def validate(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
 
 
+_RDF_FORMAT_BY_SUFFIX = {
+    ".ttl": "turtle",
+    ".turtle": "turtle",
+    ".nt": "nt",
+    ".ntriples": "nt",
+    ".jsonld": "json-ld",
+    ".json-ld": "json-ld",
+    ".json": "json-ld",
+}
+
+
+def _rdf_format_for(path: str) -> str:
+    """RDF format for a file, chosen from its extension."""
+    suffix = Path(path).suffix.lower()
+    if suffix not in _RDF_FORMAT_BY_SUFFIX:
+        raise click.BadParameter(
+            f"cannot tell the RDF format of '{path}' from its extension; "
+            f"use one of {', '.join(sorted(_RDF_FORMAT_BY_SUFFIX))}",
+            param_hint="'DATA' / '--shapes'",
+        )
+    return _RDF_FORMAT_BY_SUFFIX[suffix]
+
+
 @validate.command("shacl")
-@click.option("--shapes", default=None, type=click.Path(exists=True),
-              help="SHACL shapes file (auto-generated if omitted).")
-@click.option("--strictness", type=click.Choice(["strict", "moderate", "lenient"]),
-              default="moderate", show_default=True)
+@click.argument("data", type=click.Path(exists=True, dir_okay=False))
+@click.option("--shapes", required=True, type=click.Path(exists=True, dir_okay=False),
+              help="SHACL shapes file (Turtle, JSON-LD or N-Triples).")
 @click.option("--report", default=None, type=click.Path(),
               help="Write validation report to file.")
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def validate_shacl(cli_ctx: CLIContext, shapes: Optional[str], strictness: str,
+def validate_shacl(cli_ctx: CLIContext, data: str, shapes: str,
                    report: Optional[str], local_json: bool) -> None:
-    """Validate data against SHACL constraint shapes.
+    """Validate an RDF file against SHACL constraint shapes.
+
+    Both files are read as RDF; their format comes from the file extension
+    (.ttl, .nt, .jsonld, .json).
 
     \b
     Example:
-      semantica validate shacl --strictness strict --report report.json
+      semantica validate shacl data.ttl --shapes shapes.ttl
     """
     cli_ctx = _require_ctx(cli_ctx)
+    data_format = _rdf_format_for(data)
+    shapes_format = _rdf_format_for(shapes)
 
     def _action() -> None:
         try:
-            from .ontology import OntologyValidator
-            v = OntologyValidator(config=cli_ctx.config.to_dict())
-            result = v.validate_shacl(shapes_file=shapes, strictness=strictness)
+            from .ontology import run_shacl_validation
         except ImportError as exc:
-            raise click.ClickException(f"Ontology/validation module not available: {exc}") from exc
-        payload = result if isinstance(result, dict) else {"valid": bool(result)}
+            raise click.ClickException(
+                f"Ontology/validation module not available: {exc}"
+            ) from exc
+        try:
+            shacl_report = run_shacl_validation(
+                Path(data).read_text(encoding="utf-8"),
+                Path(shapes).read_text(encoding="utf-8"),
+                data_graph_format=data_format,
+                shacl_format=shapes_format,
+            )
+        except ImportError as exc:
+            raise click.ClickException(
+                "SHACL validation needs pyshacl, which ships in the optional "
+                "'shacl' extra: pip install 'semantica[shacl]'"
+            ) from exc
+        payload = {
+            "conforms": shacl_report.conforms,
+            "violation_count": shacl_report.violation_count,
+            "violations": _serialize_extract_result(shacl_report.violations),
+            "warnings": _serialize_extract_result(shacl_report.warnings),
+        }
         if report:
             Path(report).write_text(json.dumps(payload, default=str), encoding="utf-8")
             _ok(cli_ctx, f"Wrote {report}")
         if _is_json(cli_ctx, local_json):
             _jecho(payload)
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, payload)
+        if not shacl_report.conforms:
+            # Exit non-zero like `pipeline validate`, so CI can gate on it
+            # without parsing the report.
+            raise SystemExit(1)
 
     _run_with_error_handling(_action)
 
@@ -4286,11 +4572,23 @@ def validate_shacl(cli_ctx: CLIContext, shapes: Optional[str], strictness: str,
               type=click.Choice(["value", "property", "type", "relationship",
                                   "temporal", "logical", "entity", "all"]),
               default="all", show_default=True)
+@click.option(
+    "--property",
+    "property_name",
+    default=None,
+    help="Property to compare (value and property strategies).",
+)
 @click.option("--format", "fmt", type=click.Choice(["json", "table"]),
               default="json", show_default=True)
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def validate_conflicts(cli_ctx: CLIContext, strategy: str, fmt: str, local_json: bool) -> None:
+def validate_conflicts(
+    cli_ctx: CLIContext,
+    strategy: str,
+    property_name: Optional[str],
+    fmt: str,
+    local_json: bool,
+) -> None:
     """Detect value, type, temporal, and logical conflicts.
 
     \b
@@ -4298,17 +4596,35 @@ def validate_conflicts(cli_ctx: CLIContext, strategy: str, fmt: str, local_json:
       semantica validate conflicts --format json | jq '.conflicts | length'
     """
     cli_ctx = _require_ctx(cli_ctx)
+    if property_name and strategy not in ("value", "property"):
+        raise click.UsageError(
+            f"--property has no meaning for --strategy {strategy}; it is only "
+            "read by the 'value' and 'property' strategies."
+        )
+    if strategy in ("value", "property") and not property_name:
+        raise click.UsageError(f"--strategy {strategy} needs --property.")
 
     def _action() -> None:
         try:
-            from .conflicts import detect_conflicts
-            result = detect_conflicts(strategy=strategy, config=cli_ctx.config.to_dict())
+            from .conflicts import ConflictDetector
         except ImportError as exc:
             raise click.ClickException(f"Conflicts module not available: {exc}") from exc
+        graph = _knowledge_graph_dict(cli_ctx)
+        detector = ConflictDetector(config=cli_ctx.config.to_dict())
+        conflicts = detector.detect_conflicts(
+            _conflict_entities(graph),
+            method=strategy,
+            property_name=property_name,
+            relationships=graph.get("relationships", []),
+        )
+        payload = {
+            "conflicts": _serialize_extract_result(conflicts),
+            "count": len(conflicts),
+        }
         if _is_json(cli_ctx, local_json) or fmt == "json":
-            _jecho(result if isinstance(result, dict) else {"conflicts": result})
+            _jecho(payload)
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, payload)
 
     _run_with_error_handling(_action)
 
@@ -4381,6 +4697,18 @@ def ontology_generate(cli_ctx: CLIContext, domain: Optional[str], output: Option
     _run_with_error_handling(_action)
 
 
+# The CLI advertises rdflib's public format names, but the ingestor hands an
+# explicit format straight to `Dataset.parse`, which wants its own parser names.
+# Passing the advertised name through meant `rdfxml`, `jsonld` and `ntriples`
+# never reached the XML, JSON-LD or N-Triples parser (#1814 review).
+_ONTOLOGY_IMPORT_FORMATS = {
+    "turtle": "turtle",
+    "rdfxml": "xml",
+    "jsonld": "json-ld",
+    "ntriples": "nt",
+}
+
+
 @ontology.command("import")
 @click.argument("source")
 @click.option("--format", "fmt",
@@ -4406,7 +4734,10 @@ def ontology_import(cli_ctx: CLIContext, source: str, fmt: Optional[str],
             return
         try:
             from .ontology import ingest_ontology
-            result = ingest_ontology(source, format=fmt, config=cli_ctx.config.to_dict())
+            ingest_kwargs: Dict[str, Any] = {}
+            if fmt:
+                ingest_kwargs["format"] = _ONTOLOGY_IMPORT_FORMATS[fmt]
+            result = ingest_ontology(source, **ingest_kwargs)
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
         if _is_json(cli_ctx, local_json):
@@ -4418,24 +4749,37 @@ def ontology_import(cli_ctx: CLIContext, source: str, fmt: Optional[str],
 
 
 @ontology.command("validate")
-@click.option("--shapes", default=None, type=click.Path(exists=True))
-@click.option("--strictness", type=click.Choice(["strict", "moderate", "lenient"]),
-              default="moderate", show_default=True)
+@click.option("--shapes", default=None, hidden=True,
+              help="Moved: use `semantica validate shacl DATA --shapes SHAPES`.")
 @click.option("--report", default=None, type=click.Path())
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def ontology_validate(cli_ctx: CLIContext, shapes: Optional[str], strictness: str,
-                      report: Optional[str], local_json: bool) -> None:
-    """Run SHACL validation on the ontology."""
+def ontology_validate(
+    cli_ctx: CLIContext, shapes: Optional[str],
+    report: Optional[str], local_json: bool
+) -> None:
+    """Check the generated ontology for consistency and satisfiability.
+
+    \b
+    Example:
+      semantica ontology validate --report ontology_report.json
+    """
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
+        # --shapes moved to `validate shacl`. Keep accepting it so an existing
+        # script gets a pointer instead of Click's "No such option" usage error
+        # (#1814 review).
+        if shapes:
+            raise click.ClickException(
+                "`ontology validate` no longer takes --shapes; use "
+                "`semantica validate shacl DATA --shapes SHAPES`."
+            )
         try:
             from .ontology import validate_ontology
-            result = validate_ontology(shapes_file=shapes, strictness=strictness,
-                                       config=cli_ctx.config.to_dict())
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
+        result = validate_ontology(_ontology_from_graph(cli_ctx))
         payload = result if isinstance(result, dict) else {"valid": bool(result)}
         if report:
             Path(report).write_text(json.dumps(payload, default=str), encoding="utf-8")
@@ -4443,7 +4787,7 @@ def ontology_validate(cli_ctx: CLIContext, shapes: Optional[str], strictness: st
         if _is_json(cli_ctx, local_json):
             _jecho(payload)
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, payload)
 
     _run_with_error_handling(_action)
 
@@ -4459,11 +4803,11 @@ def ontology_shacl(cli_ctx: CLIContext, output: Optional[str], local_json: bool)
     def _action() -> None:
         try:
             from .ontology import SHACLGenerator
-            gen = SHACLGenerator(config=cli_ctx.config.to_dict())
-            result = gen.generate()
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
-        text = str(result)
+        generator = SHACLGenerator(config=cli_ctx.config.to_dict())
+        shapes_graph = generator.generate(_ontology_from_graph(cli_ctx))
+        text = generator.serialize(shapes_graph, format="turtle")
         if output:
             Path(output).write_text(text, encoding="utf-8")
             _ok(cli_ctx, f"Wrote {output}")
@@ -4576,33 +4920,76 @@ def ontology_health(cli_ctx: CLIContext, fmt: str, local_json: bool) -> None:
 
     def _action() -> None:
         try:
-            from .ontology import OntologyValidator
-            v = OntologyValidator(config=cli_ctx.config.to_dict())
-            result = v.health()
+            from .ontology import OntologyEngine
         except ImportError as exc:
             raise click.ClickException(f"Ontology module not available: {exc}") from exc
+        # Read the graph once and hand it to the quality gate as well: the
+        # generated ontology does not retain the instances, so without this the
+        # report omitted every instance-level check (#1814 review).
+        graph = _knowledge_graph_dict(cli_ctx)
+        report = OntologyEngine().quality_check(
+            _ontology_from_graph(cli_ctx, graph), graph_data=graph
+        )
+        payload = _serialize_extract_result(report)
         if _is_json(cli_ctx, local_json) or fmt == "json":
-            _jecho(result if isinstance(result, dict) else {"health": str(result)})
+            _jecho(payload if isinstance(payload, dict) else {"health": payload})
         else:
-            _pprint(cli_ctx, result)
+            _pprint(cli_ctx, payload)
 
     _run_with_error_handling(_action)
 
 
 @ontology.command("version")
+@click.option("--storage", "storage_path", default=None,
+              type=click.Path(exists=True, dir_okay=False),
+              help="SQLite store holding saved ontology snapshots.")
 @click.option("--json", "local_json", is_flag=True, default=False)
 @click.pass_obj
-def ontology_version(cli_ctx: CLIContext, local_json: bool) -> None:
+def ontology_version(cli_ctx: CLIContext, storage_path: Optional[str],
+                     local_json: bool) -> None:
     """Manage ontology versions."""
     cli_ctx = _require_ctx(cli_ctx)
 
     def _action() -> None:
         try:
             from .change_management import OntologyVersionManager
-            v = OntologyVersionManager(**cli_ctx.config.to_dict())
-            result = v.current()
         except ImportError as exc:
-            raise click.ClickException(f"Change management module not available: {exc}") from exc
+            raise click.ClickException(
+                f"Change management module not available: {exc}"
+            ) from exc
+        # OntologyVersionManager keeps an in-memory store unless it is handed a
+        # path, and Config.to_dict() has no top-level one, so the command read a
+        # fresh store and reported "no versions" no matter what another process
+        # had saved (#1814 review). Resolve the shared store from the flag or
+        # `custom.ontology.version_storage_path` — Config keeps a fixed set of
+        # sections, so a setting outside them only survives under `custom`.
+        storage = storage_path or cli_ctx.config.get(
+            "custom.ontology.version_storage_path"
+        )
+        # Same check --storage gets from click.Path(exists=True): opening a
+        # missing path would create an empty SQLite file.
+        if storage and not Path(storage).is_file():
+            raise click.ClickException(
+                f"Ontology version store '{storage}' does not exist."
+            )
+        manager = (
+            OntologyVersionManager(storage_path=storage)
+            if storage
+            else OntologyVersionManager()
+        )
+        versions = manager.list_versions()
+        if versions:
+            result = max(versions, key=lambda s: str(s.get("timestamp") or ""))
+        elif storage:
+            result = {"version": None, "message": "No ontology versions recorded yet."}
+        else:
+            result = {
+                "version": None,
+                "message": (
+                    "No persistent version store selected; pass --storage or set "
+                    "custom.ontology.version_storage_path to read saved snapshots."
+                ),
+            }
         if _is_json(cli_ctx, local_json):
             _jecho(result if isinstance(result, dict) else {"version": str(result)})
         else:
@@ -5477,9 +5864,9 @@ def _collect_backup_sources(
 ) -> Tuple[List[Tuple[str, Path]], List[Dict[str, str]]]:
     """Return (arcname, local_path) pairs for local files to include in a backup.
 
-    Also returns each configured store whose local path does not exist, so the
-    caller can report it instead of writing a partial archive with no sign that
-    a store was dropped (#2009).
+    Also returns each configured store whose local path does not exist or holds
+    no files, so the caller can report it instead of writing a partial archive
+    with no sign that a store was dropped (#2009, #2014).
     """
     sources: List[Tuple[str, Path]] = []
     skipped: List[Dict[str, str]] = []
@@ -5498,11 +5885,26 @@ def _collect_backup_sources(
         if ont_path:
             p = Path(ont_path)
             if p.is_dir():
+                before = len(sources)
                 for f in p.rglob("*"):
                     if f.is_file():
                         sources.append((f"ontology/{f.relative_to(p)}", f))
+                if len(sources) == before:
+                    # An existing-but-empty directory contributed nothing; report
+                    # it instead of dropping it silently (#2014).
+                    skipped.append({
+                        "store": "ontology",
+                        "backend": "file",
+                        "path": _redact(ont_path),
+                    })
             elif p.is_file():
                 sources.append((f"ontology/{p.name}", p))
+            else:
+                skipped.append({
+                    "store": "ontology",
+                    "backend": "file",
+                    "path": _redact(ont_path),
+                })
 
     store_map = {"graph": "graph_db", "vector": "vector_store", "triplet": "triplet_store"}
     for store_type, cfg_key in store_map.items():
@@ -5520,9 +5922,19 @@ def _collect_backup_sources(
             continue
         p = Path(data_path)
         if p.is_dir():
+            before = len(sources)
             for f in p.rglob("*"):
                 if f.is_file():
                     sources.append((f"{store_type}/{f.relative_to(p)}", f))
+            if len(sources) == before:
+                # Same reporting rule as a missing path: an empty directory
+                # yields no files, so the store would vanish from the archive
+                # with no sign of it (#2014).
+                skipped.append({
+                    "store": store_type,
+                    "backend": str(info.get("backend", "unknown")),
+                    "path": _redact(data_path),
+                })
         elif p.is_file():
             sources.append((f"{store_type}/{p.name}", p))
         else:
@@ -5535,6 +5947,54 @@ def _collect_backup_sources(
             })
 
     return sources, skipped
+
+
+def _skip_label(store: str) -> str:
+    """Human label for a skipped entry, without calling ontology a 'store'."""
+    return "ontology" if store == "ontology" else f"{store} store"
+
+
+def _warn_skipped(cli_ctx: CLIContext, skipped: List[Dict[str, str]]) -> None:
+    """Name every configured path that contributed no files (#2009, #2014)."""
+    for entry in skipped:
+        _warn(
+            cli_ctx,
+            f"Skipping {_skip_label(entry['store'])} ({entry['backend']}): "
+            f"path does not exist or contains no files: {entry['path']}",
+        )
+
+
+def _raise_on_no_store_data(sources: List[Tuple[str, Path]], include: str) -> None:
+    """Refuse a backup that would hold no store data at all (#1820).
+
+    Called by the real command and by its dry run alike: a preview that
+    reports success for an archive the real command refuses to write is the
+    same surprise as a successful backup with nothing in it (#2122).
+    """
+    if include not in ("graph", "vector", "triplet", "all"):
+        return
+    if any(arcname.startswith(("graph/", "vector/", "triplet/"))
+           for arcname, _ in sources):
+        return
+    stores = "graph, vector and triplet stores" if include == "all" else f"{include} store"
+    raise click.ClickException(
+        f"No store data to back up: found no local files for the {stores}. "
+        "backup create only copies file-based stores (a graph_db / vector_store / "
+        "triplet_store path that exists on disk); run `semantica backup info` "
+        "to see how to back up other backends."
+    )
+
+
+def _raise_on_skipped(skipped: List[Dict[str, str]], *, target: str) -> None:
+    """Raise the --fail-on-skip error naming every skipped path."""
+    if not skipped:
+        return
+    missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
+    raise click.ClickException(
+        f"Configured store path does not exist or contains no files: {missing}. "
+        f"Nothing from those stores would be {target}; create the path, drop it "
+        "from the config, or omit --fail-on-skip to continue with the rest."
+    )
 
 
 def _redact(uri: str) -> str:
@@ -5603,7 +6063,7 @@ def backup_info(cli_ctx: CLIContext, local_json: bool) -> None:
 @click.option("--strip-config", is_flag=True, default=False,
               help="Exclude semantica.yaml to avoid storing credentials at rest.")
 @click.option("--fail-on-skip", is_flag=True, default=False,
-              help="Exit non-zero when a configured store path does not exist.")
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
@@ -5623,7 +6083,24 @@ def backup_create(
 
     def _action() -> None:
         if _is_dry(cli_ctx, local_dry):
-            _dry(cli_ctx, "backup create", destination=destination, include=include)
+            # A dry run is a preview of the real command, so it has to report
+            # the same skipped stores, honour --fail-on-skip and refuse an
+            # archive the real run would not write (#2109, #2122).
+            cfg = cli_ctx.config.to_dict()
+            sources, skipped = _collect_backup_sources(
+                cfg, cli_ctx.config_path, include, strip_config,
+            )
+            _warn_skipped(cli_ctx, skipped)
+            _raise_on_no_store_data(sources, include)
+            if fail_on_skip:
+                _raise_on_skipped(skipped, target="in the archive")
+            _dry(
+                cli_ctx,
+                "backup create",
+                destination=destination,
+                include=include,
+                skipped=skipped,
+            )
             return
 
         if keyfile:
@@ -5656,34 +6133,14 @@ def backup_create(
         # so a partial archive was reported as a success (#2009). Report every
         # one before the prompts, and before the empty-archive check below so
         # the missing paths are named even when no store is left to back up.
-        for entry in skipped:
-            _warn(
-                cli_ctx,
-                f"Skipping {entry['store']} store ({entry['backend']}): "
-                f"path does not exist: {entry['path']}",
-            )
+        _warn_skipped(cli_ctx, skipped)
 
         # Fail before any prompt instead of writing an archive with no
         # store data in it (#1820).
-        if include in ("graph", "vector", "triplet", "all") and not any(
-            arcname.startswith(("graph/", "vector/", "triplet/"))
-            for arcname, _ in sources
-        ):
-            stores = "graph, vector and triplet stores" if include == "all" else f"{include} store"
-            raise click.ClickException(
-                f"No store data to back up: found no local files for the {stores}. "
-                "backup create only copies file-based stores (a graph_db / vector_store / "
-                "triplet_store path that exists on disk); run `semantica backup info` "
-                "to see how to back up other backends."
-            )
+        _raise_on_no_store_data(sources, include)
 
-        if skipped and fail_on_skip:
-            missing = ", ".join(f"{e['store']} ({e['path']})" for e in skipped)
-            raise click.ClickException(
-                f"Configured store path does not exist: {missing}. Nothing from "
-                "those stores would be in the archive; create the path, drop it "
-                "from the config, or omit --fail-on-skip to back up the rest."
-            )
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="in the archive")
 
         if encrypt and passphrase is None:
             passphrase = click.prompt("Backup passphrase", hide_input=True,
@@ -5775,11 +6232,13 @@ def backup_create(
 @click.option("--include",
               type=click.Choice(["graph", "vector", "triplet", "config", "ontology", "all"]),
               default="all", show_default=True)
+@click.option("--fail-on-skip", is_flag=True, default=False,
+              help="Exit non-zero when a configured store path is missing or empty.")
 @click.option("--dry-run", "local_dry", is_flag=True, default=False)
 @click.option("--quiet", "local_quiet", is_flag=True, default=False)
 @click.pass_obj
 def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
-                local_dry: bool, local_quiet: bool) -> None:
+                fail_on_skip: bool, local_dry: bool, local_quiet: bool) -> None:
     """Incremental folder sync (idempotent, copies only changed files).
 
     \b
@@ -5793,12 +6252,17 @@ def backup_sync(cli_ctx: CLIContext, destination: str, include: str,
         import shutil
         dest = Path(destination)
         cfg = cli_ctx.config.to_dict()
-        sources, _skipped = _collect_backup_sources(
+        sources, skipped = _collect_backup_sources(
             cfg, cli_ctx.config_path, include, strip_config=False,
         )
+        # A skipped store used to be discarded here, so a sync after a partial
+        # create reported success for an incomplete store set (#2014).
+        _warn_skipped(cli_ctx, skipped)
+        if fail_on_skip:
+            _raise_on_skipped(skipped, target="included in the sync")
         if _is_dry(cli_ctx, local_dry):
             _dry(cli_ctx, "sync backup", destination=str(dest), include=include,
-                 files=[a for a, _ in sources])
+                 files=[a for a, _ in sources], skipped=skipped)
             return
         dest.mkdir(parents=True, exist_ok=True)
         try:

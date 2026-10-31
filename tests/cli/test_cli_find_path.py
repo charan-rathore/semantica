@@ -43,3 +43,23 @@ class TestResolveEntity:
         graph.add_node(9, name="Alice")
         with pytest.raises(ClickException, match="ambiguous.*3, 9"):
             _resolve_entity(graph, "Alice")
+
+
+
+class TestResolveEntityUnicodeAndLongDigits:
+    def test_superscript_digit_token_falls_through_to_unknown_entity_error(self):
+        graph = nx.DiGraph()
+        graph.add_node(42, name="answer")
+        with pytest.raises(ClickException):
+            _resolve_entity(graph, "\u00b2")
+
+    def test_overlong_digit_token_falls_through_to_unknown_entity_error(self):
+        graph = nx.DiGraph()
+        graph.add_node(42, name="answer")
+        with pytest.raises(ClickException):
+            _resolve_entity(graph, "9" * 5000)
+
+    def test_superscript_token_still_resolves_by_name(self):
+        graph = nx.DiGraph()
+        graph.add_node("node-1", name="x\u00b2")
+        assert _resolve_entity(graph, "x\u00b2") == "node-1"

@@ -2006,9 +2006,16 @@ def _resolve_entity(graph: Any, token: str) -> Any:
     # (Neo4j) key nodes by integer ID, so retry a numeric token as an int
     # (#2179).
     if token.isdigit():
-        numeric_token = int(token)
-        if numeric_token in graph:
-            return numeric_token
+        # isdigit() accepts characters int() rejects (superscripts), and
+        # int() caps digit-string length, so a failed conversion must fall
+        # through to name matching rather than crash.
+        try:
+            numeric_token = int(token)
+        except ValueError:
+            pass
+        else:
+            if numeric_token in graph:
+                return numeric_token
     matches = [
         node for node, attrs in graph.nodes(data=True)
         if attrs.get("name") == token

@@ -612,16 +612,34 @@ class TestPathFinderEdgeCases:
         assert length == 1000.001
     
     def test_negative_weights(self):
-        """Test path finding with negative weights."""
+        """Negative weights must raise instead of returning a wrong path (#2180)."""
         negative_graph = nx.Graph()
         negative_graph.add_edge("A", "B", weight=-1.0)
         negative_graph.add_edge("B", "C", weight=2.0)
         negative_graph.add_edge("A", "C", weight=1.0)
-        
-        # Dijkstra should handle negative weights (though not optimal for negative cycles)
-        path = self.finder.dijkstra_shortest_path(negative_graph, "A", "C")
-        # Should still find a path, though may not be optimal with negative weights
-        assert path in [["A", "C"], ["A", "B", "C"]]
+
+        with pytest.raises(ValueError, match="non-negative edge weights"):
+            self.finder.dijkstra_shortest_path(negative_graph, "A", "C")
+
+    def test_negative_weight_rejects_before_wrong_answer(self):
+        """Regression for #2180: the settled-node case that returned a
+        non-optimal path must raise, naming the offending edge."""
+        graph = nx.DiGraph()
+        graph.add_edge("A", "B", weight=1.0)
+        graph.add_edge("B", "C", weight=-3.0)
+        graph.add_edge("A", "C", weight=1.0)
+
+        with pytest.raises(ValueError, match="'B' -> 'C'"):
+            self.finder.dijkstra_shortest_path(graph, "A", "C")
+
+    def test_negative_weight_in_unreachable_component_tolerated(self):
+        """A negative edge that no source-to-target path can use does not
+        affect correctness, so it must not raise."""
+        graph = nx.DiGraph()
+        graph.add_edge("A", "C", weight=1.0)
+        graph.add_edge("X", "Y", weight=-5.0)
+
+        assert self.finder.dijkstra_shortest_path(graph, "A", "C") == ["A", "C"]
     
     def test_zero_weight_edges(self):
         """Test path finding with zero weight edges."""

@@ -174,6 +174,34 @@ class PathFinder:
 
         traversal_graph = graph if directed else self._make_undirected_view(graph)
 
+        # Dijkstra settles each node once, so a negative edge can make it
+        # return a non-optimal path silently (#2180). Reject any negative
+        # edge reachable from the source instead of answering wrong.
+        reachable = {source}
+        scan_queue = deque([source])
+        while scan_queue:
+            scan_node = scan_queue.popleft()
+            if scan_node in excluded_nodes:
+                continue
+            for scan_neighbor, scan_edge_data in self._get_neighbors(
+                traversal_graph, scan_node
+            ):
+                scan_weight = self._get_edge_weight(
+                    scan_edge_data, weight_attribute, default_weight
+                )
+                if scan_weight < 0:
+                    raise ValueError(
+                        "Dijkstra's algorithm requires non-negative edge weights; "
+                        f"edge {scan_node!r} -> {scan_neighbor!r} has weight "
+                        f"{scan_weight}"
+                    )
+                if (
+                    scan_neighbor not in reachable
+                    and scan_neighbor not in excluded_nodes
+                ):
+                    reachable.add(scan_neighbor)
+                    scan_queue.append(scan_neighbor)
+
         # Dijkstra's algorithm
         distances = {source: 0.0}
         previous = {}

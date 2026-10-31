@@ -45,7 +45,6 @@ class TestResolveEntity:
             _resolve_entity(graph, "Alice")
 
 
-
 class TestResolveEntityUnicodeAndLongDigits:
     def test_superscript_digit_token_falls_through_to_unknown_entity_error(self):
         graph = nx.DiGraph()

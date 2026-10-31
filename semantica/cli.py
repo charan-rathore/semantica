@@ -1998,10 +1998,17 @@ def _kg_nx_graph(cli_ctx: CLIContext) -> Any:
     return graph
 
 
-def _resolve_entity(graph: Any, token: str) -> str:
+def _resolve_entity(graph: Any, token: str) -> Any:
     """Map a ``--from``/``--to`` entity name or ID onto its graph node ID."""
     if token in graph:
         return token
+    # Click passes every option value as a string, but some graph stores
+    # (Neo4j) key nodes by integer ID, so retry a numeric token as an int
+    # (#2179).
+    if token.isdigit():
+        numeric_token = int(token)
+        if numeric_token in graph:
+            return numeric_token
     matches = [
         node for node, attrs in graph.nodes(data=True)
         if attrs.get("name") == token
@@ -2014,7 +2021,7 @@ def _resolve_entity(graph: Any, token: str) -> str:
     if len(matches) > 1:
         raise click.ClickException(
             f"Entity name '{token}' is ambiguous ({len(matches)} nodes); pass "
-            "the entity ID instead: " + ", ".join(sorted(matches))
+            "the entity ID instead: " + ", ".join(sorted(str(m) for m in matches))
         )
     return matches[0]
 
